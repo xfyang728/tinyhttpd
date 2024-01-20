@@ -24,6 +24,8 @@ using namespace std;
 #include "hloop.h"
 #include <filesystem>
 #include <fstream>
+#include "hstring.h"
+#include <regex>
 
  /*
   * workflow:
@@ -36,8 +38,10 @@ using namespace std;
   *
   */
 
+static const char* route = "";
+static const char* mode = "";
 static const char* host = "0.0.0.0";
-static int port = 8000;
+static int port = 7800;
 static int thread_num = 1;
 static hloop_t* accept_loop = NULL;
 static hloop_t** worker_loops = NULL;
@@ -57,6 +61,7 @@ static hloop_t** worker_loops = NULL;
 // Content-Type
 #define TEXT_PLAIN      "text/plain"
 #define TEXT_HTML       "text/html"
+#define APP_JS       "application/javascript"
 
 typedef enum {
 	s_begin,
@@ -191,134 +196,188 @@ static void on_write(hio_t* io, const void* buf, int writebytes) {
 	http_send_file(conn);
 }
 
+string join(char c, vector<string> src) {
+	string res = "";
+	if (src.size() == 0) return res;
+
+	vector<string>::iterator it = src.begin();
+	res += *it;
+
+	for (it++; it != src.end(); it++) {
+		res += c;
+		res += *it;
+	}
+	return res;
+}
+void index_replay(http_conn_t* conn, string filepath, string last_dir_name,
+	string folder, string current_path) {
+	stringstream ss;
+	ss << "<html>\r\n"
+		"<head>\r\n"
+		"<title>File Index</title>\r\n"
+		"</head>\r\n"
+		"<body>\r\n"
+		"<h1>Index of ";
+
+	ss << filepath;
+	ss << "</h1>\r\n";
+	if (filepath != "/") {
+		ss << "<li><a href=\"";
+		ss << "/";
+		ss << "\">";
+		ss << "root";
+		ss << "</a></li>\r\n";
+
+		ss << "<li><a href=\"";
+		if (!last_dir_name.empty()) {
+			ss << "./";
+		}
+		else {
+			ss << "../";
+		}
+		ss << "\">";
+		ss << "../";
+		ss << "</a></li>\r\n";
+	}
+
+	multimap<string/*url name*/, std::pair<uintmax_t/*note name*/, string/*file path*/> > file_map;
+	for (auto const& dir_entry : filesystem::directory_iterator{ folder }) {
+		auto name = dir_entry.path().filename().string();
+		auto size = 0;
+		if (!dir_entry.is_directory())
+		{
+			size = dir_entry.file_size();
+		}
+		auto path = dir_entry.path().string();
+		path.replace(0, current_path.size(), "");
+		file_map.emplace(name, std::make_pair(size, path));
+	}
+	//如果是root目录，添加虚拟目录
+	int i = 0;
+	for (auto& pr : file_map) {
+		auto& strAbsolutePath = pr.second.second;
+		bool isDir = filesystem::is_directory(strAbsolutePath);
+		ss << "<li><span>" << i++ << "</span>\t";
+		ss << "<a href=\"";
+		//路径链接地址
+		ss << pr.second.second;
+		ss << "\">";
+		//路径名称
+		ss << pr.first;
+		if (isDir) {
+			ss << "/</a></li>\r\n";
+			continue;
+		}
+		//是文件
+		auto fileSize = pr.second.first;
+		if (fileSize <= 0) {
+			ss << "/" << endl;
+		}
+		else if (fileSize < 1024) {
+			ss << " (" << fileSize << "B)" << endl;
+		}
+		else if (fileSize < 1024 * 1024) {
+			ss << fixed << setprecision(2) << " (" << fileSize / 1024.0 << "KB)";
+		}
+		else if (fileSize < 1024 * 1024 * 1024) {
+			ss << fixed << setprecision(2) << " (" << fileSize / 1024 / 1024.0 << "MB)";
+		}
+		else {
+			ss << fixed << setprecision(2) << " (" << fileSize / 1024 / 1024 / 1024.0 << "GB)";
+		}
+		ss << "</a></li>\r\n";
+	}
+	ss << "<ul>\r\n";
+	ss << "</ul>\r\n</body></html>";
+
+	http_reply(conn, 200, HTTP_OK, TEXT_HTML, ss.str().c_str(), 0);
+}
+
 static int http_serve_file(http_conn_t* conn) {
 	http_msg_t* req = &conn->request;
 	http_msg_t* resp = &conn->response;
 	// GET / HTTP/1.1\r\n
 	const char* filepath = req->path + 1;
 
-	string strPathPrefix(filepath);
+	string strFilePath(filepath);
 	//url后缀有没有'/'访问文件夹，处理逻辑不一致
 	string last_dir_name;
-	if (strPathPrefix.back() == '/') {
-		strPathPrefix.pop_back();
+	if (strFilePath.back() == '/') {
+		strFilePath.pop_back();
 	}
 	else {
-		last_dir_name = hv::split(strPathPrefix, '/').back();
+		last_dir_name = hv::split(strFilePath, '/').back();
 	}
+	printf("\nfilepath: %s \n", strFilePath.c_str());
 	// homepage
-	if (*filepath == '\0' || filesystem::is_directory(filepath)) {
-		string current_path = filesystem::current_path().string();
-		string folder = current_path;
+	string current_path = filesystem::current_path().string();
+	string folder = current_path;
+	if (*mode == '\0') {
 		if (*filepath == '\0') {
-			strPathPrefix = "index.html";
+			strFilePath = "index.html";
+			index_replay(conn, strFilePath, last_dir_name, folder, current_path);
 		}
 		if (filesystem::is_directory(filepath)) {
-			folder = folder + "/" + strPathPrefix;
-			strPathPrefix = strPathPrefix + "/index.html";
+			folder = folder + "/" + strFilePath;
+			strFilePath = strFilePath + "/index.html";
+			index_replay(conn, strFilePath, last_dir_name, folder, current_path);
 		}
-		filepath = strPathPrefix.c_str();
+	}
+	else {
+		string strMode(mode);
+		//regex pattern("manage");
+		//strFilePath = regex_replace(strFilePath, pattern, strMode);
+		if (*filepath == '\0') {
+			strMode = strMode + "/index.html";
+		}else {
+			string::size_type idx;
+			idx = strFilePath.find(route);
+			if (idx == string::npos) {//不存在。
+				strMode = strMode + "/" + strFilePath;
+			}
+			else { //存在。
+				regex pattern(route);
+				strMode = regex_replace(strFilePath, pattern, strMode);
+				if (filesystem::is_directory(strMode)) {
+					strMode = strMode + "/index.html";
+				}
+			}
 
-		stringstream ss;
-		ss << "<html>\r\n"
-			"<head>\r\n"
-			"<title>File Index</title>\r\n"
-			"</head>\r\n"
-			"<body>\r\n"
-			"<h1>Index of ";
-
-		ss << filepath;
-		ss << "</h1>\r\n";
-		if (filepath != "/") {
-			ss << "<li><a href=\"";
-			ss << "/";
-			ss << "\">";
-			ss << "root";
-			ss << "</a></li>\r\n";
-
-			ss << "<li><a href=\"";
-			if (!last_dir_name.empty()) {
-				ss << "./";
-			}
-			else {
-				ss << "../";
-			}
-			ss << "\">";
-			ss << "../";
-			ss << "</a></li>\r\n";
 		}
-
-		multimap<string/*url name*/, std::pair<uintmax_t/*note name*/, string/*file path*/> > file_map;
-		for (auto const& dir_entry : filesystem::directory_iterator{ folder }) {
-			auto name = dir_entry.path().filename().string();
-			auto size = 0;
-			if (!dir_entry.is_directory())
-			{
-				size = dir_entry.file_size();
-			}
-			auto path = dir_entry.path().string();
-			path.replace(0, current_path.size(), "");
-			file_map.emplace(name, std::make_pair(size, path));
-		}
-		//如果是root目录，添加虚拟目录
-		int i = 0;
-		for (auto& pr : file_map) {
-			auto& strAbsolutePath = pr.second.second;
-			bool isDir = filesystem::is_directory(strAbsolutePath);
-			ss << "<li><span>" << i++ << "</span>\t";
-			ss << "<a href=\"";
-			//路径链接地址
-			ss << pr.second.second;
-			ss << "\">";
-			//路径名称
-			ss << pr.first;
-			if (isDir) {
-				ss << "/</a></li>\r\n";
-				continue;
-			}
-			//是文件
-			auto fileSize = pr.second.first;
-			if (fileSize <= 0) {
-				ss << "/" << endl;
-			}
-			else if (fileSize < 1024) {
-				ss << " (" << fileSize << "B)" << endl;
-			}
-			else if (fileSize < 1024 * 1024) {
-				ss << fixed << setprecision(2) << " (" << fileSize / 1024.0 << "KB)";
-			}
-			else if (fileSize < 1024 * 1024 * 1024) {
-				ss << fixed << setprecision(2) << " (" << fileSize / 1024 / 1024.0 << "MB)";
-			}
-			else {
-				ss << fixed << setprecision(2) << " (" << fileSize / 1024 / 1024 / 1024.0 << "GB)";
-			}
-			ss << "</a></li>\r\n";
-		}
-		ss << "<ul>\r\n";
-		ss << "</ul>\r\n</body></html>";
-		if (filesystem::exists(filesystem::path(filepath))) {
-			filesystem::remove(filesystem::path(filepath));
-		}
-		ofstream fout;
-		fout.open(filepath, std::ios::out | std::ios::app);
-		fout << ss.str() << std::endl;
-		fout.close();
+		strFilePath = strMode;
+		printf("open files: %s \n", strMode.c_str());
 	}
 
 	// open file
-	conn->fp = fopen(filepath, "rb");
+	//printf("open files: %s \n", filepath);
+	conn->fp = fopen(strFilePath.c_str(), "rb");
 	if (!conn->fp) {
-		http_reply(conn, 404, NOT_FOUND, TEXT_HTML, HTML_TAG_BEGIN NOT_FOUND HTML_TAG_END, 0);
-		return 404;
+		//hv::StringList strTryPath = hv::split(strFilePath, '/');
+		//strTryPath.pop_back();
+		string tryPath = strFilePath + "/index.html";
+		printf("Try files: %s \n", tryPath.c_str());
+		conn->fp = fopen(tryPath.c_str(), "rb");
+		if (!conn->fp) {
+			string strMode(mode);
+			strMode = strMode + "/index.html";
+			printf("Try files: %s \n", strMode.c_str());
+			conn->fp = fopen(strMode.c_str(), "rb");
+			if (!conn->fp) {
+				http_reply(conn, 404, NOT_FOUND, TEXT_HTML, HTML_TAG_BEGIN NOT_FOUND HTML_TAG_END, 0);
+				return 404;
+			}
+		}
 	}
 	// send head
-	size_t filesize = hv_filesize(filepath);
+	size_t filesize = hv_filesize(strFilePath.c_str());
 	resp->content_length = filesize;
-	const char* suffix = hv_suffixname(filepath);
+	const char* suffix = hv_suffixname(strFilePath.c_str());
 	const char* content_type = NULL;
 	if (strcmp(suffix, "html") == 0) {
 		content_type = TEXT_HTML;
+	}
+	else if (strcmp(suffix, "js") == 0) {
+		content_type = APP_JS;
 	}
 	else {
 		// TODO: set content_type by suffix
@@ -578,15 +637,22 @@ static HTHREAD_ROUTINE(accept_thread) {
 }
 
 int main(int argc, char** argv) {
-	if (argc < 2) {
-		printf("Usage: %s port [thread_num]\n", argv[0]);
-		port = 7800;
+	if (argc < 3) {
+		printf("Usage: %s route mode port [thread_num]\n", argv[0]);
+	}
+	else if (argc < 4) {
+		printf("Usage: %s route mode port [thread_num]\n", argv[0]);
+		route = argv[1];
+		mode = argv[2];
 	}
 	else {
-		port = atoi(argv[1]);
+		route = argv[1];
+		mode = argv[2];
+		port = atoi(argv[3]);
 	}
-	if (argc > 2) {
-		thread_num = atoi(argv[2]);
+	printf("location: %s \n", mode);
+	if (argc > 4) {
+		thread_num = atoi(argv[4]);
 	}
 	else {
 		thread_num = get_ncpu();
