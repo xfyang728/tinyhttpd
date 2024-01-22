@@ -313,14 +313,17 @@ static int http_serve_file(http_conn_t* conn) {
 	string current_path = filesystem::current_path().string();
 	string folder = current_path;
 	if (*mode == '\0') {
+		printf("mode: %s route: %s \n", mode, route);
 		if (*filepath == '\0') {
 			strFilePath = "index.html";
 			index_replay(conn, strFilePath, last_dir_name, folder, current_path);
+			return 200;
 		}
 		if (filesystem::is_directory(filepath)) {
 			folder = folder + "/" + strFilePath;
 			strFilePath = strFilePath + "/index.html";
 			index_replay(conn, strFilePath, last_dir_name, folder, current_path);
+			return 200;
 		}
 	}
 	else {
